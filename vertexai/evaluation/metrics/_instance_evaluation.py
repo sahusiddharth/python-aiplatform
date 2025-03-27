@@ -28,6 +28,11 @@ from google.cloud.aiplatform_v1.services import (
 from google.cloud.aiplatform_v1.types import (
     evaluation_service as gapic_eval_service_types,
 )
+
+from ragas.metrics.base import Metric as RagasMetric
+from ragas.metrics.base import ModeMetric
+from ragas.dataset_schema import SingleTurnSample, EvaluationResult
+
 from vertexai.evaluation import _base as eval_base
 from vertexai.evaluation import constants
 from vertexai.evaluation import (
@@ -105,6 +110,13 @@ def build_request(
         metric_name = constants.Metric.POINTWISE_METRIC
     elif isinstance(metric, pairwise_metric.PairwiseMetric):
         metric_name = constants.Metric.PAIRWISE_METRIC
+    elif isinstance(metric, RagasMetric):
+        response = row_dict.get("response")
+        reference = row_dict.get("reference")
+        user_input = row_dict.get("user_input")
+        sample = SingleTurnSample(
+            user_input=user_input, response=response, reference=reference
+        )
     else:
         metric_name = str(metric)
 
@@ -112,6 +124,7 @@ def build_request(
         metric_spec = _METRIC_NAME_TO_METRIC_SPEC[metric_name]
     except KeyError as e:
         raise ValueError(f"Metric name: {metric_name} is not supported.") from e
+
     model_based_metric_instance_input = {}
     metric_column_mapping = evaluation_run_config.metric_column_mapping
     if isinstance(
@@ -342,6 +355,12 @@ def _parse_pointwise_results(
     }
 
 
+def _parse_ragas_metric_results(
+    metric_result_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    pass
+
+
 def _parse_model_based_translation_results(
     metric_result_dict: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -395,6 +414,10 @@ def handle_response(
     """
     if isinstance(response, str):
         return response
+
+    if isinstance(response, EvaluationResult):
+        result_dict = response.to_pandas().to_dict()
+        return {constants.MetricResult.SCORE_KEY: list(result_dict.values())[-1][0]}
 
     metric_type = response._pb.WhichOneof("evaluation_results")
 

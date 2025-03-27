@@ -26,6 +26,11 @@ from google.cloud.aiplatform import base
 from google.cloud.aiplatform_v1beta1.types import (
     content as gapic_content_types,
 )
+
+from ragas.metrics.base import Metric as RagasMetric
+from ragas.dataset_schema import SingleTurnSample, EvaluationDataset
+from ragas import evaluate as ragas_evaluate
+
 from vertexai import generative_models
 from vertexai.evaluation import _base as evaluation_base
 from vertexai.evaluation import constants
@@ -145,6 +150,13 @@ def _validate_response_column_required(
                 evaluation_run_config,
                 constants.Dataset.MODEL_RESPONSE_COLUMN,
             )
+        elif isinstance(
+            metric, RagasMetric
+        ) and "response" in metric.required_columns.get("SINGLE_TURN"):
+            _validate_column_provided(
+                evaluation_run_config,
+                "response",
+            )
 
 
 def _validate_reference_column_required(
@@ -158,6 +170,15 @@ def _validate_reference_column_required(
             evaluation_run_config,
             constants.Dataset.REFERENCE_COLUMN,
         )
+
+    for metric in evaluation_run_config.metrics:
+        if isinstance(metric, RagasMetric):
+            if "reference" in metric.required_columns.get("SINGLE_TURN"):
+                _validate_column_provided(
+                    evaluation_run_config,
+                    constants.Dataset.REFERENCE_COLUMN,
+                )
+                break
 
 
 def _validate_column_provided(
@@ -191,6 +212,12 @@ def _validate_reference_or_source_column_required(
                     evaluation_run_config,
                     constants.Dataset.SOURCE_COLUMN,
                 )
+        elif isinstance(metric, RagasMetric):
+            if "reference" in metric.required_columns.get("SINGLE_TURN"):
+                _validate_column_provided(
+                    evaluation_run_config,
+                    "reference",
+                )
 
 
 def _compute_custom_metrics(
@@ -223,9 +250,9 @@ def _compute_custom_metrics(
         for future in futures_list:
             metric_output = future.result()
             try:
-                row_dict[
-                    f"{custom_metric.name}/{constants.MetricResult.SCORE_KEY}"
-                ] = metric_output[custom_metric.name]
+                row_dict[f"{custom_metric.name}/{constants.MetricResult.SCORE_KEY}"] = (
+                    metric_output[custom_metric.name]
+                )
             except KeyError:
                 raise KeyError(
                     f"Custom metric score `{custom_metric.name}` not found in"
@@ -241,18 +268,76 @@ def _compute_custom_metrics(
     return row_dict
 
 
-def _separate_custom_metrics(
+def _compute_ragas_metrics(
+    row_dict: Dict[str, Any],
+    ragas_metrics: List[metrics_base.CustomMetric],
+    pbar: tqdm,
+    executor: futures.ThreadPoolExecutor,
+) -> Dict[str, Any]:
+    """Computes custom metrics for a row.
+
+    Args:
+        row_dict: A dictionary of an instance in the eval dataset.
+        custom_metrics: A list of CustomMetrics.
+        pbar: A tqdm progress bar.
+        executor: A thread pool executor.
+
+    Returns:
+        A dictionary of an instance containing custom metric results.
+
+    Raises:
+        KeyError: If the custom metric function does not return a valid output.
+    """
+    futures_by_metric = collections.defaultdict(list)
+    for ragas_metric in ragas_metrics:
+        sample = SingleTurnSample(
+            user_input=row_dict["user_input"],
+            retrieved_contexts=row_dict["retrieved_contexts"],
+            response=row_dict["response"],
+            reference=row_dict["reference"],
+            rubric=row_dict["rubric"],
+        )
+        ragas_eval_dataset = EvaluationDataset(samples=[sample])
+        future = executor.submit(
+            ragas_evaluate,
+            dataset=ragas_eval_dataset,
+            metrics=[ragas_metric],
+            show_progress=False,
+        )
+        future.add_done_callback(lambda _: pbar.update(1))
+        futures_by_metric[ragas_metric].append(future)
+
+    for ragas_metric, futures_list in futures_by_metric.items():
+        for future in futures_list:
+            metric_output = future.result()
+            row_dict[f"{ragas_metric.name}/{constants.MetricResult.SCORE_KEY}"] = (
+                metric_output.to_pandas().to_dict()[ragas_metric.name][0]
+            )
+            # Include additional metric results like explanation.
+            for key, value in metric_output.items():
+                if key != ragas_metric.name:
+                    row_dict[f"{ragas_metric.name}/{key}"] = value
+    return row_dict
+
+
+def _separate_metrics(
     metrics: List[Union[str, metrics_base._Metric]],
-) -> Tuple[List[Union[str, metrics_base._Metric]], List[metrics_base.CustomMetric],]:
+) -> Tuple[
+    List[Union[str, metrics_base._Metric]],
+    List[metrics_base.CustomMetric],
+]:
     """Separates the metrics list into API and custom metrics."""
-    custom_metrics = []
     api_metrics = []
+    custom_metrics = []
+    ragas_metrics = []
     for metric in metrics:
         if isinstance(metric, metrics_base.CustomMetric):
             custom_metrics.append(metric)
+        elif isinstance(metric, RagasMetric):
+            ragas_metrics.append(metric)
         else:
             api_metrics.append(metric)
-    return api_metrics, custom_metrics
+    return api_metrics, custom_metrics, ragas_metrics
 
 
 def _aggregate_summary_metrics(
@@ -286,6 +371,14 @@ def _aggregate_summary_metrics(
                     ]
                     == "BASELINE"
                 ).mean()
+            elif isinstance(metric, RagasMetric):
+                summary_metrics[f"{metric.name}/mean"] = metrics_table.loc[
+                    :, f"{metric.name}/{constants.MetricResult.SCORE_KEY}"
+                ].mean()
+                summary_metrics[f"{metric.name}/std"] = metrics_table.loc[
+                    :, f"{metric.name}/{constants.MetricResult.SCORE_KEY}"
+                ].std()
+
             else:
                 summary_metrics[f"{str(metric)}/mean"] = metrics_table.loc[
                     :, f"{str(metric)}/{constants.MetricResult.SCORE_KEY}"
@@ -498,9 +591,9 @@ def _run_model_inference(
                     )
                 t2 = time.perf_counter()
                 _LOGGER.info(f"Multithreaded Batch Inference took: {t2 - t1} seconds.")
-                evaluation_run_config.metric_column_mapping[
+                evaluation_run_config.metric_column_mapping[response_column_name] = (
                     response_column_name
-                ] = response_column_name
+                )
             else:
                 raise ValueError(
                     "Missing required input `prompt` column to start model inference."
@@ -586,15 +679,15 @@ def _assemble_prompt_for_dataset(
     )
 
     try:
-        evaluation_run_config.dataset[
-            constants.Dataset.PROMPT_COLUMN
-        ] = evaluation_run_config.dataset.apply(
-            lambda row: str(
-                prompt_template.assemble(
-                    **row[list(prompt_template.variables)].astype(str).to_dict(),
-                )
-            ),
-            axis=1,
+        evaluation_run_config.dataset[constants.Dataset.PROMPT_COLUMN] = (
+            evaluation_run_config.dataset.apply(
+                lambda row: str(
+                    prompt_template.assemble(
+                        **row[list(prompt_template.variables)].astype(str).to_dict(),
+                    )
+                ),
+                axis=1,
+            )
         )
         if (
             constants.Dataset.PROMPT_COLUMN
@@ -611,9 +704,9 @@ def _assemble_prompt_for_dataset(
                 " parameter is provided. Please verify that you want to use"
                 " the assembled `prompt` column for evaluation."
             )
-        evaluation_run_config.metric_column_mapping[
+        evaluation_run_config.metric_column_mapping[constants.Dataset.PROMPT_COLUMN] = (
             constants.Dataset.PROMPT_COLUMN
-        ] = constants.Dataset.PROMPT_COLUMN
+        )
     except Exception as e:
         raise ValueError(
             f"Failed to assemble prompt template: {e}. Please make sure all"
@@ -665,6 +758,7 @@ def _parse_metric_results_to_dataframe(
 
     metrics_table = pd.DataFrame(dict(zip(instance_df.columns, instance_df.values.T)))
     for metric, metric_results in results.items():
+
         if isinstance(metric, pointwise_metric.PointwiseMetric):
             _set_metric_table(
                 metric.metric_name,
@@ -707,6 +801,13 @@ def _parse_metric_results_to_dataframe(
                 metrics_table,
                 constants.MetricResult.SCORE_KEY,
             )
+        elif isinstance(metric, RagasMetric):
+            _set_metric_table(
+                metric.name,
+                metric_results,
+                metrics_table,
+                constants.MetricResult.SCORE_KEY,
+            )
         else:
             _LOGGER.warning(
                 f"Metric name: {str(metric)} is not supported when parsing"
@@ -738,13 +839,16 @@ def _compute_metrics(
             ' google-cloud-aiplatform[evaluation]"'
         )
 
-    api_metrics, custom_metrics = _separate_custom_metrics(
+    api_metrics, custom_metrics, ragas_metrics = _separate_metrics(
         evaluation_run_config.metrics
     )
     row_count = len(evaluation_run_config.dataset)
     api_request_count = len(api_metrics) * row_count
     custom_metric_request_count = len(custom_metrics) * row_count
-    total_request_count = api_request_count + custom_metric_request_count
+    ragas_metric_request_count = len(ragas_metrics) * row_count
+    total_request_count = (
+        api_request_count + custom_metric_request_count + ragas_metric_request_count
+    )
 
     _LOGGER.info(
         f"Computing metrics with a total of {total_request_count} Vertex Gen AI"
@@ -772,6 +876,23 @@ def _compute_metrics(
                         ),
                         rate_limiter=rate_limiter,
                         retry_timeout=evaluation_run_config.retry_timeout,
+                    )
+                    future.add_done_callback(lambda _: pbar.update(1))
+                    futures_by_metric[metric].append((future, idx))
+                for metric in ragas_metrics:
+                    sample = SingleTurnSample(
+                        user_input=row_dict.get("user_input"),
+                        retrieved_contexts=[row_dict.get("retrieved_contexts")],
+                        response=row_dict.get("response"),
+                        reference=row_dict.get("reference"),
+                        rubric=row_dict.get("rubric"),
+                    )
+                    ragas_eval_dataset = EvaluationDataset(samples=[sample])
+                    future = executor.submit(
+                        ragas_evaluate,
+                        dataset=ragas_eval_dataset,
+                        metrics=[metric],
+                        show_progress=False,
                     )
                     future.add_done_callback(lambda _: pbar.update(1))
                     futures_by_metric[metric].append((future, idx))

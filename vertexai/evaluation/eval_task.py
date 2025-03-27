@@ -19,6 +19,8 @@ from typing import Any, Callable, Dict, List, Literal, Optional, TYPE_CHECKING, 
 import uuid
 import warnings
 
+from ragas.metrics.base import Metric as RagasMetric
+
 from google.api_core import exceptions
 import vertexai
 from google.cloud.aiplatform import base
@@ -246,6 +248,7 @@ class EvalTask:
                     "tool_parameter_key_match",
                     "tool_parameter_kv_match",
                 ],
+                RagasMetric,
                 metrics_base.CustomMetric,
                 metrics_base._AutomaticMetric,
                 metrics_base._TranslationMetric,
@@ -303,7 +306,7 @@ class EvalTask:
         return self._dataset
 
     @property
-    def metrics(self) -> List[Union[str, metrics_base.CustomMetric]]:
+    def metrics(self) -> List[Union[str, metrics_base.CustomMetric, RagasMetric]]:
         """Returns metrics."""
         return self._metrics
 
