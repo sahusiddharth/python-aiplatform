@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 """Library for metrics computation with Gen AI Evaluation Service."""
-
+import asyncio
 import json
 from typing import Any, Dict, Union
 
@@ -29,9 +29,7 @@ from google.cloud.aiplatform_v1.types import (
     evaluation_service as gapic_eval_service_types,
 )
 
-from ragas.metrics.base import Metric as RagasMetric
-from ragas.metrics.base import ModeMetric
-from ragas.dataset_schema import SingleTurnSample, EvaluationResult
+from ragas.metrics.base import Metric
 
 from vertexai.evaluation import _base as eval_base
 from vertexai.evaluation import constants
@@ -110,13 +108,6 @@ def build_request(
         metric_name = constants.Metric.POINTWISE_METRIC
     elif isinstance(metric, pairwise_metric.PairwiseMetric):
         metric_name = constants.Metric.PAIRWISE_METRIC
-    elif isinstance(metric, RagasMetric):
-        response = row_dict.get("response")
-        reference = row_dict.get("reference")
-        user_input = row_dict.get("user_input")
-        sample = SingleTurnSample(
-            user_input=user_input, response=response, reference=reference
-        )
     else:
         metric_name = str(metric)
 
@@ -355,12 +346,6 @@ def _parse_pointwise_results(
     }
 
 
-def _parse_ragas_metric_results(
-    metric_result_dict: Dict[str, Any],
-) -> Dict[str, Any]:
-    pass
-
-
 def _parse_model_based_translation_results(
     metric_result_dict: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -415,9 +400,9 @@ def handle_response(
     if isinstance(response, str):
         return response
 
-    if isinstance(response, EvaluationResult):
-        result_dict = response.to_pandas().to_dict()
-        return {constants.MetricResult.SCORE_KEY: list(result_dict.values())[-1][0]}
+    if asyncio.iscoroutine(response):
+        result = asyncio.run(response)
+        return {constants.MetricResult.SCORE_KEY: result}
 
     metric_type = response._pb.WhichOneof("evaluation_results")
 

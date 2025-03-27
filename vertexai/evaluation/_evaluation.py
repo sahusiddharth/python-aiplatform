@@ -28,8 +28,7 @@ from google.cloud.aiplatform_v1beta1.types import (
 )
 
 from ragas.metrics.base import Metric as RagasMetric
-from ragas.dataset_schema import SingleTurnSample, EvaluationDataset
-from ragas import evaluate as ragas_evaluate
+from ragas.dataset_schema import SingleTurnSample
 
 from vertexai import generative_models
 from vertexai.evaluation import _base as evaluation_base
@@ -265,58 +264,6 @@ def _compute_custom_metrics(
             for key, value in metric_output.items():
                 if key != custom_metric.name:
                     row_dict[f"{custom_metric.name}/{key}"] = value
-    return row_dict
-
-
-def _compute_ragas_metrics(
-    row_dict: Dict[str, Any],
-    ragas_metrics: List[metrics_base.CustomMetric],
-    pbar: tqdm,
-    executor: futures.ThreadPoolExecutor,
-) -> Dict[str, Any]:
-    """Computes custom metrics for a row.
-
-    Args:
-        row_dict: A dictionary of an instance in the eval dataset.
-        custom_metrics: A list of CustomMetrics.
-        pbar: A tqdm progress bar.
-        executor: A thread pool executor.
-
-    Returns:
-        A dictionary of an instance containing custom metric results.
-
-    Raises:
-        KeyError: If the custom metric function does not return a valid output.
-    """
-    futures_by_metric = collections.defaultdict(list)
-    for ragas_metric in ragas_metrics:
-        sample = SingleTurnSample(
-            user_input=row_dict["user_input"],
-            retrieved_contexts=row_dict["retrieved_contexts"],
-            response=row_dict["response"],
-            reference=row_dict["reference"],
-            rubric=row_dict["rubric"],
-        )
-        ragas_eval_dataset = EvaluationDataset(samples=[sample])
-        future = executor.submit(
-            ragas_evaluate,
-            dataset=ragas_eval_dataset,
-            metrics=[ragas_metric],
-            show_progress=False,
-        )
-        future.add_done_callback(lambda _: pbar.update(1))
-        futures_by_metric[ragas_metric].append(future)
-
-    for ragas_metric, futures_list in futures_by_metric.items():
-        for future in futures_list:
-            metric_output = future.result()
-            row_dict[f"{ragas_metric.name}/{constants.MetricResult.SCORE_KEY}"] = (
-                metric_output.to_pandas().to_dict()[ragas_metric.name][0]
-            )
-            # Include additional metric results like explanation.
-            for key, value in metric_output.items():
-                if key != ragas_metric.name:
-                    row_dict[f"{ragas_metric.name}/{key}"] = value
     return row_dict
 
 
@@ -887,12 +834,9 @@ def _compute_metrics(
                         reference=row_dict.get("reference"),
                         rubric=row_dict.get("rubric"),
                     )
-                    ragas_eval_dataset = EvaluationDataset(samples=[sample])
                     future = executor.submit(
-                        ragas_evaluate,
-                        dataset=ragas_eval_dataset,
-                        metrics=[metric],
-                        show_progress=False,
+                        metric.single_turn_ascore,
+                        sample
                     )
                     future.add_done_callback(lambda _: pbar.update(1))
                     futures_by_metric[metric].append((future, idx))
