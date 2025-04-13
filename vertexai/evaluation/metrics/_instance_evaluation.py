@@ -403,6 +403,9 @@ def handle_response(
     if asyncio.iscoroutine(response):
         result = asyncio.run(response)
         return {constants.MetricResult.SCORE_KEY: result}
+    
+    if isinstance(response, float):
+        return response
 
     metric_type = response._pb.WhichOneof("evaluation_results")
 
