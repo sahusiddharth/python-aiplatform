@@ -49,6 +49,7 @@ bigquery/docs/generated
 docs.metadata
 
 # Virtual environment
+.env
 env/
 venv/
 
