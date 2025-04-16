@@ -27,9 +27,6 @@ from google.cloud.aiplatform_v1beta1.types import (
     content as gapic_content_types,
 )
 
-from ragas.metrics.base import Metric as RagasMetric
-from ragas.dataset_schema import SingleTurnSample
-
 from vertexai import generative_models
 from vertexai.evaluation import _base as evaluation_base
 from vertexai.evaluation import constants
@@ -60,6 +57,8 @@ except ImportError:
 
 if TYPE_CHECKING:
     import pandas as pd
+    from ragas.metrics.base import Metric as RagasMetric
+    from ragas.dataset_schema import EvaluationDataset as RagasEvaluationDataset
 
 _LOGGER = base.Logger(__name__)
 _SUCCESSFUL_FINISH_REASONS = [
@@ -135,6 +134,7 @@ def _validate_dataset(
     _validate_response_column_required(evaluation_run_config)
     _validate_reference_column_required(evaluation_run_config)
     _validate_reference_or_source_column_required(evaluation_run_config)
+    _validate_ragas_metrics_columns(evaluation_run_config)
 
 
 def _validate_response_column_required(
@@ -149,13 +149,6 @@ def _validate_response_column_required(
                 evaluation_run_config,
                 constants.Dataset.MODEL_RESPONSE_COLUMN,
             )
-        elif isinstance(
-            metric, RagasMetric
-        ) and "response" in metric.required_columns.get("SINGLE_TURN"):
-            _validate_column_provided(
-                evaluation_run_config,
-                "response",
-            )
 
 
 def _validate_reference_column_required(
@@ -169,15 +162,6 @@ def _validate_reference_column_required(
             evaluation_run_config,
             constants.Dataset.REFERENCE_COLUMN,
         )
-
-    for metric in evaluation_run_config.metrics:
-        if isinstance(metric, RagasMetric):
-            if "reference" in metric.required_columns.get("SINGLE_TURN"):
-                _validate_column_provided(
-                    evaluation_run_config,
-                    constants.Dataset.REFERENCE_COLUMN,
-                )
-                break
 
 
 def _validate_column_provided(
@@ -211,12 +195,50 @@ def _validate_reference_or_source_column_required(
                     evaluation_run_config,
                     constants.Dataset.SOURCE_COLUMN,
                 )
-        elif isinstance(metric, RagasMetric):
-            if "reference" in metric.required_columns.get("SINGLE_TURN"):
-                _validate_column_provided(
-                    evaluation_run_config,
-                    "reference",
-                )
+
+
+def _ragas_metric_required_columns(
+    evaluation_run_config: evaluation_base.EvaluationRunConfig,
+):
+    """Returns list of required columns for ragas metrics."""
+    try:
+        from ragas.metrics.base import Metric as RagasMetric
+    except ImportError:
+        raise ImportError(
+            'Ragas is not installed. Please install the library using "pip install'
+            ' ragas"'
+        )
+    required_columns = set()
+    for metric in evaluation_run_config.metrics:
+        if isinstance(metric, RagasMetric) and isinstance(
+            metric.required_columns, dict
+        ):
+            required_columns.update(metric.required_columns.get("SINGLE_TURN"))
+    return list(required_columns)
+
+
+def _validate_ragas_metrics_columns(
+    evaluation_run_config: evaluation_base.EvaluationRunConfig,
+):
+    """Checks if all columns required for ragas metrics calculation exists in the dataset."""
+    try:
+        from ragas.dataset_schema import EvaluationDataset
+    except ImportError:
+        raise ImportError(
+            'Ragas is not installed. Please install the library using "pip install'
+            ' ragas"'
+        )
+    required_columns = _ragas_metric_required_columns(evaluation_run_config)
+    for required in required_columns:
+        if required not in evaluation_run_config.dataset.columns:
+            raise KeyError(
+                "Required column"
+                f" `{required}`"
+                " not found in the evaluation dataset. The columns in the"
+                f" evaluation dataset are {list(evaluation_run_config.dataset.columns)}."
+            )
+
+    return EvaluationDataset.from_pandas(dataframe=evaluation_run_config.dataset[required_columns])
 
 
 def _compute_custom_metrics(
@@ -274,6 +296,13 @@ def _separate_metrics(
     List[metrics_base.CustomMetric],
 ]:
     """Separates the metrics list into API and custom metrics."""
+    try:
+        from ragas.metrics.base import Metric as RagasMetric
+    except ImportError:
+        raise ImportError(
+            'Ragas is not installed. Please install the library using "pip install'
+            ' ragas"'
+        )
     api_metrics = []
     custom_metrics = []
     ragas_metrics = []
@@ -300,6 +329,13 @@ def _aggregate_summary_metrics(
     Returns:
         A dictionary containing summary metrics results and statistics.
     """
+    try:
+        from ragas.metrics.base import Metric as RagasMetric
+    except ImportError:
+        raise ImportError(
+            'Ragas is not installed. Please install the library using "pip install'
+            ' ragas"'
+        )
     summary_metrics = {}
     summary_metrics[constants.MetricResult.ROW_COUNT_KEY] = metrics_table.shape[0]
 
@@ -702,6 +738,13 @@ def _parse_metric_results_to_dataframe(
             'Pandas is not installed. Please install the SDK using "pip install'
             ' google-cloud-aiplatform[evaluation]"'
         )
+    try:
+        from ragas.metrics.base import Metric as RagasMetric
+    except ImportError:
+        raise ImportError(
+            'Ragas is not installed. Please install the library using "pip install'
+            ' ragas"'
+        )
 
     metrics_table = pd.DataFrame(dict(zip(instance_df.columns, instance_df.values.T)))
     for metric, metric_results in results.items():
@@ -792,10 +835,7 @@ def _compute_metrics(
     row_count = len(evaluation_run_config.dataset)
     api_request_count = len(api_metrics) * row_count
     custom_metric_request_count = len(custom_metrics) * row_count
-    ragas_metric_request_count = len(ragas_metrics) * row_count
-    total_request_count = (
-        api_request_count + custom_metric_request_count + ragas_metric_request_count
-    )
+    total_request_count = api_request_count + custom_metric_request_count
 
     _LOGGER.info(
         f"Computing metrics with a total of {total_request_count} Vertex Gen AI"
@@ -826,20 +866,21 @@ def _compute_metrics(
                     )
                     future.add_done_callback(lambda _: pbar.update(1))
                     futures_by_metric[metric].append((future, idx))
-                for metric in ragas_metrics:
-                    sample = SingleTurnSample(
-                        user_input=row_dict.get("user_input"),
-                        retrieved_contexts=[row_dict.get("retrieved_contexts")],
-                        response=row_dict.get("response"),
-                        reference=row_dict.get("reference"),
-                        rubric=row_dict.get("rubric"),
-                    )
-                    future = executor.submit(
-                        metric.single_turn_ascore,
-                        sample
-                    )
-                    future.add_done_callback(lambda _: pbar.update(1))
-                    futures_by_metric[metric].append((future, idx))
+                # for metric in ragas_metrics:
+                #     sample = SingleTurnSample(
+                #         user_input=row_dict.get("user_input"),
+                #         retrieved_contexts=[row_dict.get("retrieved_contexts")],
+                #         response=row_dict.get("response"),
+                #         reference=row_dict.get("reference"),
+                #         rubric=row_dict.get("rubric"),
+                #     )
+                #     future = executor.submit(
+                #         run_async_metric,
+                #         metric,
+                #         sample
+                #     )
+                #     future.add_done_callback(lambda _: pbar.update(1))
+                #     futures_by_metric[metric].append((future, idx))
 
         # Retrieve results from all futures and handle errors.
         results_dict = collections.defaultdict(list)
@@ -853,10 +894,34 @@ def _compute_metrics(
                     results_dict[metric].append("Error")
                     error_list.append((metric, index, f"Error: {e}"))
 
+    if ragas_metrics:
+        try:
+            from ragas import evaluate
+            from ragas.dataset_schema import EvaluationResult
+        except ImportError:
+            raise ImportError(
+                'Ragas is not installed. Please install the library using "pip install'
+                ' ragas"'
+            )
+
+        ragas_eval_dataset = _validate_ragas_metrics_columns(evaluation_run_config=evaluation_run_config)
+        ragas_result = evaluate(
+            dataset=ragas_eval_dataset,
+            metrics=ragas_metrics,
+        )
+
     for metric, responses in results_dict.items():
         results_dict[metric] = [
             _instance_evaluation.handle_response(response) for response in responses
         ]
+
+    if isinstance(ragas_result, EvaluationResult):
+        for ragas_metric in ragas_metrics:
+            results_dict[ragas_metric] = [
+                {constants.MetricResult.SCORE_KEY: score}
+                for score in ragas_result[ragas_metric.name]
+            ]
+
     if error_list:
         _LOGGER.warning(
             f"{len(error_list)} errors encountered during evaluation. Continue to"
